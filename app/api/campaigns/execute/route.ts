@@ -1,0 +1,384 @@
+import { NextRequest, NextResponse } from "next/server"
+import { getSupabase } from "@/lib/supabase"
+
+// ---------------------------------------------------------------------------
+// Telegram helpers (same as webhook)
+// ---------------------------------------------------------------------------
+
+interface InlineButton { text: string; url: string }
+
+function buildInlineKeyboard(buttons: InlineButton[]) {
+  if (!buttons || buttons.length === 0) return undefined
+  return { inline_keyboard: buttons.map((btn) => [{ text: btn.text, url: btn.url }]) }
+}
+
+async function sendTelegramMessage(botToken: string, chatId: number, text: string, replyMarkup?: object) {
+  const url = `https://api.telegram.org/bot${botToken}/sendMessage`
+  const body: Record<string, unknown> = { chat_id: chatId, text, parse_mode: "HTML" }
+  if (replyMarkup) body.reply_markup = replyMarkup
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+  return res.json()
+}
+
+async function sendTelegramPhoto(botToken: string, chatId: number, photoUrl: string, caption: string, replyMarkup?: object) {
+  const url = `https://api.telegram.org/bot${botToken}/sendPhoto`
+  if (photoUrl.startsWith("data:")) {
+    const formData = new FormData()
+    formData.append("chat_id", String(chatId))
+    if (caption) formData.append("caption", caption)
+    formData.append("parse_mode", "HTML")
+    if (replyMarkup) formData.append("reply_markup", JSON.stringify(replyMarkup))
+    const base64Match = photoUrl.match(/^data:([^;]+);base64,(.+)$/)
+    if (base64Match) {
+      const binaryStr = atob(base64Match[2])
+      const bytes = new Uint8Array(binaryStr.length)
+      for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i)
+      formData.append("photo", new Blob([bytes], { type: base64Match[1] }), "photo.jpg")
+    }
+    const res = await fetch(url, { method: "POST", body: formData })
+    return res.json()
+  }
+  const body: Record<string, unknown> = { chat_id: chatId, photo: photoUrl, caption, parse_mode: "HTML" }
+  if (replyMarkup) body.reply_markup = replyMarkup
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+  return res.json()
+}
+
+async function sendTelegramVideo(botToken: string, chatId: number, videoUrl: string, caption: string, replyMarkup?: object) {
+  const url = `https://api.telegram.org/bot${botToken}/sendVideo`
+  if (videoUrl.startsWith("data:")) {
+    const formData = new FormData()
+    formData.append("chat_id", String(chatId))
+    if (caption) formData.append("caption", caption)
+    formData.append("parse_mode", "HTML")
+    if (replyMarkup) formData.append("reply_markup", JSON.stringify(replyMarkup))
+    const base64Match = videoUrl.match(/^data:([^;]+);base64,(.+)$/)
+    if (base64Match) {
+      const binaryStr = atob(base64Match[2])
+      const bytes = new Uint8Array(binaryStr.length)
+      for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i)
+      formData.append("video", new Blob([bytes], { type: base64Match[1] }), "video.mp4")
+    }
+    const res = await fetch(url, { method: "POST", body: formData })
+    return res.json()
+  }
+  const body: Record<string, unknown> = { chat_id: chatId, video: videoUrl, caption, parse_mode: "HTML" }
+  if (replyMarkup) body.reply_markup = replyMarkup
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+  return res.json()
+}
+
+// ---------------------------------------------------------------------------
+// Send a campaign message node to a user
+// ---------------------------------------------------------------------------
+
+async function sendCampaignMessageToUser(
+  botToken: string,
+  chatId: number,
+  config: Record<string, unknown>
+) {
+  const text = (config.text as string) || ""
+  const mediaType = (config.media_type as string) || ""
+  const mediaUrl = (config.media_url as string) || ""
+  const buttonsStr = (config.buttons as string) || ""
+
+  let inlineKeyboard: object | undefined
+  if (buttonsStr) {
+    try {
+      inlineKeyboard = buildInlineKeyboard(JSON.parse(buttonsStr) as InlineButton[])
+    } catch { /* ignore */ }
+  }
+
+  const displayText = text || "Mensagem"
+  const hasMedia = !!mediaUrl && !!mediaType
+
+  try {
+    if (hasMedia) {
+      // Send media alone first
+      if (mediaType === "photo") {
+        await sendTelegramPhoto(botToken, chatId, mediaUrl, "", undefined)
+      } else if (mediaType === "video") {
+        await sendTelegramVideo(botToken, chatId, mediaUrl, "", undefined)
+      }
+      // Then send text + buttons
+      await sendTelegramMessage(botToken, chatId, displayText, inlineKeyboard)
+    } else {
+      await sendTelegramMessage(botToken, chatId, displayText, inlineKeyboard)
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Delay conversion
+// ---------------------------------------------------------------------------
+
+const DELAY_MS: Record<string, number> = {
+  "1h": 3600000,
+  "6h": 21600000,
+  "12h": 43200000,
+  "1d": 86400000,
+  "2d": 172800000,
+  "3d": 259200000,
+  "7d": 604800000,
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/campaigns/execute
+// Called when campaign is activated OR by cron to process pending sends
+// ---------------------------------------------------------------------------
+
+export async function POST(req: NextRequest) {
+  const supabase = getSupabase()
+
+  try {
+    const body = await req.json().catch(() => ({}))
+    const campaignId = (body as { campaign_id?: string }).campaign_id
+    const now = new Date()
+
+    // ----- Mode 1: Specific campaign just activated => initialize all users -----
+    if (campaignId) {
+      const { data: campaign } = await supabase
+        .from("campaigns")
+        .select("*")
+        .eq("id", campaignId)
+        .single()
+
+      if (!campaign || campaign.status !== "ativa") {
+        return NextResponse.json({ error: "Campanha nao encontrada ou nao ativa" }, { status: 400 })
+      }
+
+      // Fetch bot token separately
+      const { data: bot } = await supabase
+        .from("bots")
+        .select("token")
+        .eq("id", campaign.bot_id)
+        .single()
+
+      if (!bot?.token) {
+        return NextResponse.json({ error: "Bot nao encontrado" }, { status: 400 })
+      }
+
+      const botToken = bot.token
+
+      // Get campaign nodes ordered by position
+      const { data: nodes } = await supabase
+        .from("campaign_nodes")
+        .select("*")
+        .eq("campaign_id", campaignId)
+        .order("position", { ascending: true })
+
+      if (!nodes || nodes.length === 0) {
+        return NextResponse.json({ error: "Campanha sem nodes" }, { status: 400 })
+      }
+
+      // Get all bot users
+      const { data: botUsers } = await supabase
+        .from("bot_users")
+        .select("id, telegram_user_id, chat_id")
+        .eq("bot_id", campaign.bot_id)
+
+      if (!botUsers || botUsers.length === 0) {
+        return NextResponse.json({ sent: 0, message: "Nenhum usuario no bot" })
+      }
+
+      // Find the first message node (skip leading delays)
+      let firstMessageIdx = 0
+      for (let i = 0; i < nodes.length; i++) {
+        if (nodes[i].type === "message") {
+          firstMessageIdx = i
+          break
+        }
+      }
+
+      const firstMessageNode = nodes[firstMessageIdx]
+      let sentCount = 0
+      let failCount = 0
+
+      for (const user of botUsers) {
+        // Check if user already has state for this campaign
+        const { data: existing } = await supabase
+          .from("campaign_user_state")
+          .select("id")
+          .eq("campaign_id", campaignId)
+          .eq("bot_user_id", user.id)
+          .limit(1)
+
+        if (existing && existing.length > 0) continue // already enrolled
+
+        // Send the first message immediately
+        const success = await sendCampaignMessageToUser(
+          botToken,
+          user.chat_id,
+          firstMessageNode.config as Record<string, unknown>
+        )
+
+        if (success) sentCount++
+        else failCount++
+
+        // Record the send
+        await supabase.from("campaign_sends").insert({
+          campaign_id: campaignId,
+          campaign_node_id: firstMessageNode.id,
+          bot_user_id: user.id,
+          telegram_user_id: user.telegram_user_id,
+          chat_id: user.chat_id,
+          status: success ? "sent" : "failed",
+        })
+
+        // Calculate next_send_at based on next node(s)
+        let nextSendAt: string | null = null
+        let nextPosition = firstMessageIdx + 1
+
+        // Walk through delay nodes to calculate when the next message should be sent
+        let accumulatedDelay = 0
+        for (let i = nextPosition; i < nodes.length; i++) {
+          if (nodes[i].type === "delay") {
+            const delayValue = (nodes[i].config as Record<string, unknown>).delay as string || "1d"
+            accumulatedDelay += DELAY_MS[delayValue] || 86400000
+            nextPosition = i + 1
+          } else {
+            // Found the next message node
+            break
+          }
+        }
+
+        if (nextPosition < nodes.length) {
+          nextSendAt = new Date(now.getTime() + accumulatedDelay).toISOString()
+        }
+
+        // Create user state
+        await supabase.from("campaign_user_state").upsert({
+          campaign_id: campaignId,
+          bot_user_id: user.id,
+          telegram_user_id: user.telegram_user_id,
+          chat_id: user.chat_id,
+          current_node_position: nextPosition < nodes.length ? nextPosition : nodes.length,
+          next_send_at: nextSendAt,
+          status: nextPosition >= nodes.length ? "completed" : "active",
+        }, { onConflict: "campaign_id,bot_user_id" })
+
+        // Small delay to avoid Telegram rate limits (30 msgs/sec)
+        await new Promise((r) => setTimeout(r, 50))
+      }
+
+      return NextResponse.json({ sent: sentCount, failed: failCount, total: botUsers.length })
+    }
+
+    // ----- Mode 2: Cron/scheduled => process users whose next_send_at has passed -----
+    const { data: pendingStates } = await supabase
+      .from("campaign_user_state")
+      .select("*")
+      .eq("status", "active")
+      .not("next_send_at", "is", null)
+      .lte("next_send_at", now.toISOString())
+      .limit(100)
+
+    if (!pendingStates || pendingStates.length === 0) {
+      return NextResponse.json({ processed: 0 })
+    }
+
+    let processedCount = 0
+
+    for (const state of pendingStates) {
+      // Fetch campaign and bot token separately
+      const { data: campaign2 } = await supabase
+        .from("campaigns")
+        .select("id, bot_id, status")
+        .eq("id", state.campaign_id)
+        .single()
+
+      if (!campaign2 || campaign2.status !== "ativa") continue
+
+      const { data: bot2 } = await supabase
+        .from("bots")
+        .select("token")
+        .eq("id", campaign2.bot_id)
+        .single()
+
+      if (!bot2?.token) continue
+
+      const botToken = bot2.token
+      const campaignId2 = campaign2.id
+
+      // Get all nodes for this campaign
+      const { data: allNodes } = await supabase
+        .from("campaign_nodes")
+        .select("*")
+        .eq("campaign_id", campaignId2)
+        .order("position", { ascending: true })
+
+      if (!allNodes) continue
+
+      const currentPos = state.current_node_position
+      if (currentPos >= allNodes.length) {
+        // Campaign finished for this user
+        await supabase
+          .from("campaign_user_state")
+          .update({ status: "completed", updated_at: now.toISOString() })
+          .eq("id", state.id)
+        continue
+      }
+
+      // Current node should be a message
+      const currentNode = allNodes[currentPos]
+      if (currentNode.type !== "message") continue
+
+      // Send
+      const success = await sendCampaignMessageToUser(
+        botToken,
+        state.chat_id,
+        currentNode.config as Record<string, unknown>
+      )
+
+      // Record send
+      await supabase.from("campaign_sends").insert({
+        campaign_id: campaignId2,
+        campaign_node_id: currentNode.id,
+        bot_user_id: state.bot_user_id,
+        telegram_user_id: state.telegram_user_id,
+        chat_id: state.chat_id,
+        status: success ? "sent" : "failed",
+      })
+
+      // Calculate next
+      let nextPosition = currentPos + 1
+      let accumulatedDelay = 0
+      let nextSendAt: string | null = null
+
+      for (let i = nextPosition; i < allNodes.length; i++) {
+        if (allNodes[i].type === "delay") {
+          const delayValue = (allNodes[i].config as Record<string, unknown>).delay as string || "1d"
+          accumulatedDelay += DELAY_MS[delayValue] || 86400000
+          nextPosition = i + 1
+        } else {
+          break
+        }
+      }
+
+      if (nextPosition < allNodes.length) {
+        nextSendAt = new Date(now.getTime() + accumulatedDelay).toISOString()
+      }
+
+      await supabase
+        .from("campaign_user_state")
+        .update({
+          current_node_position: nextPosition < allNodes.length ? nextPosition : allNodes.length,
+          next_send_at: nextSendAt,
+          status: nextPosition >= allNodes.length ? "completed" : "active",
+          updated_at: now.toISOString(),
+        })
+        .eq("id", state.id)
+
+      processedCount++
+      await new Promise((r) => setTimeout(r, 50))
+    }
+
+    return NextResponse.json({ processed: processedCount })
+  } catch (err) {
+    console.error("[campaigns/execute] Error:", err)
+    return NextResponse.json({ error: "Erro interno" }, { status: 500 })
+  }
+}
